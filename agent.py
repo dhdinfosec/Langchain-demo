@@ -1,20 +1,23 @@
 # ==============================================================================
 #
-# LangGraph RAG Agent with a Critic
+# LangGraph "Search-then-Read" RAG Agent (Wikipedia-Only Edition)
 #
-# This script implements a conversational agent that uses a full
-# Retrieval-Augmented Generation (RAG) pipeline to answer questions.
+# This script implements a highly sophisticated conversational agent that mimics
+# a human research process to answer questions using Wikipedia as its sole
+# source of external information.
 #
 # Key Components:
-# 1. RAG Pipeline: Instead of a simple tool, the agent now uses a multi-step
-#    process:
-#    a. Formulate Query: Intelligently decide what to search for on Wikipedia.
-#    b. Retrieve: Fetch relevant documents from Wikipedia.
-#    c. Chunk & Embed: Split documents and create a semantic vector store.
-#    d. Synthesize: Generate a final answer based on the retrieved context AND
-#       the previous critique.
-# 2. AgentNode: Encapsulates the entire RAG pipeline.
-# 3. CriticNode: Evaluates the final, synthesized answer for quality.
+# 1. Constrained Two-Step RAG ("Search-then-Read"): The agent has two tools
+#    that guarantee a Wikipedia-only workflow:
+#    a. `wikipedia_url_searcher`: A Tavily-based tool hard-coded to search
+#       only within en.wikipedia.org to find relevant URLs.
+#    b. `web_page_reader`: A tool that reads the full content of a URL provided
+#       by the searcher.
+# 2. Advanced Agentic Reasoning: The agent's core prompt instructs it on this
+#    specific two-step research process, while also allowing it to answer
+#    from its own knowledge if possible.
+# 3. CriticNode: Acts as a final quality gate on the agent's comprehensive answer,
+#    requesting revisions if the answer is unsatisfactory.
 #
 # ==============================================================================
 
@@ -25,17 +28,20 @@ import logging
 from datetime import datetime
 from typing import List, TypedDict
 
+# Set a user agent to identify requests from our script. This is placed here to
+# ensure the variable is set before any third-party libraries that might need it
+# are imported.
+os.environ["USER_AGENT"] = "LangGraph RAG Agent/1.0"
+
 # --- Third-party Library Imports ---
 from dotenv import load_dotenv
-from langchain_community.retrievers import WikipediaRetriever
-from langchain_community.vectorstores import FAISS
-from langchain_core.documents import Document
+from langchain_tavily import TavilySearch
+from langchain_community.document_loaders import WebBaseLoader
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
+from langchain_core.tools import tool
 
 from langgraph.graph import StateGraph, END
 
@@ -47,6 +53,12 @@ except ImportError:
 
 # ==============================================================================
 # SCRIPT SETUP AND CONFIGURATION
+#
+# This block handles all the preliminary setup required for the script to run.
+# It configures logging, loads API keys from a secure file, sets up environment
+# variables for services like LangSmith, defines the AI models to use, and
+# performs essential checks to ensure all required configurations are in place
+# before the main application logic begins.
 # ==============================================================================
 debug_mode = '--debug' in sys.argv
 logging.basicConfig(filename='debug.log', level=logging.DEBUG if debug_mode else logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -54,225 +66,280 @@ logging.basicConfig(filename='debug.log', level=logging.DEBUG if debug_mode else
 load_dotenv()
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
 os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGSMITH_API_KEY")
-os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGCHAIN_PROJECT", "LangGraph RAG Agent")
+os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGCHAIN_PROJECT", "LangGraph Wikipedia Agent")
+os.environ["TAVILY_API_KEY"] = os.getenv("TAVILY_API_KEY")
 
 AGENT_MODEL = "gemini-2.0-flash"
 CRITIC_MODEL = "gemini-2.5-flash"
-EMBEDDING_MODEL = "models/embedding-001"
 
 google_key = os.getenv("GOOGLE_API_KEY")
 if not google_key:
-    raise RuntimeError("GOOGLE_API_KEY not set in environment or .env file.")
+    raise RuntimeError("GOOGLE_API_KEY not set.")
+if not os.getenv("TAVILY_API_KEY"):
+    raise RuntimeError("TAVILY_API_KEY not set.")
 
 # ==============================================================================
-# RAG PIPELINE COMPONENTS (Initialized Globally)
+# TOOLS (Constrained to Wikipedia)
+#
+# This section defines the agent's capabilities. The agent is designed with a
+# "Search-then-Read" architecture, which mimics a human research workflow. This
+# requires two distinct tools: one to find relevant sources and another to read
+# their content.
 # ==============================================================================
-retriever = WikipediaRetriever(lang="en", load_max_docs=3, doc_content_chars_max=10000)
-embeddings = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL, google_api_key=google_key)
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+
+# The base Tavily search engine instance, configured to fetch 5 results.
+tavily_engine = TavilySearch(max_results=5)
+
+# Tool 1: The "Searcher" - This tool is hard-coded to search only within Wikipedia.
+@tool("wikipedia_url_searcher", description="A tool to search for Wikipedia pages and return a list of relevant URLs.")
+def wikipedia_url_searcher(query: str) -> str:
+    """
+    Performs a site-specific web search on en.wikipedia.org using the Tavily engine.
+    This gives us the powerful semantic search of Tavily, focused on the high-quality
+    data source of Wikipedia.
+    """
+    # By appending "site:en.wikipedia.org", we instruct the search engine to
+    # limit its results exclusively to pages from that domain.
+    search_query = f"{query} site:en.wikipedia.org"
+    return tavily_engine.invoke(search_query)
+
+# Tool 2: The "Reader" - This tool reads the full content of a URL found by the searcher.
+@tool("web_page_reader", description="A tool to read the full text content of a single web page URL.")
+def web_page_reader(url: str) -> str:
+    """
+    Takes a URL, loads its content using WebBaseLoader, and returns the clean text.
+    """
+    try:
+        # WebBaseLoader is a robust way to fetch and parse HTML content.
+        loader = WebBaseLoader(url)
+        docs = loader.load()
+        # Join the content and truncate to a manageable size for the LLM context.
+        full_content = "\n\n".join(doc.page_content for doc in docs)
+        return full_content[:15000]
+    except Exception as e:
+        return f"Error reading URL: {e}"
+
+# This is the final list of tools that will be made available to the agent's LLM.
+tools = [wikipedia_url_searcher, web_page_reader]
 
 # ==============================================================================
 # GRAPH STATE, NODES, AND LOGIC
+#
+# This section defines the core components of our stateful agent using LangGraph.
+# - The "State" is the memory of the system.
+# - "Nodes" are the fundamental actors or functions (like the Agent or Critic).
+# - "Logic" (or edges) defines the pathways and decisions that connect the nodes.
 # ==============================================================================
 class AgentState(TypedDict):
-    """Represents the state of the agent workflow."""
+    """
+    Defines the structure of the state object that is passed between nodes in
+    the graph. It acts as the shared memory for the entire workflow.
+    """
     messages: List[BaseMessage]
     critique: str
     iterations: int
     today: str
+    step: int
 
 class AgentNode:
-    """The node that encapsulates the RAG pipeline."""
-    def __init__(self, llm: ChatGoogleGenerativeAI):
-        self.llm = llm
-
-    def _format_docs(self, docs: List[Document]) -> str:
-        """Helper function to format retrieved documents into a single string."""
-        return "\n\n".join(doc.page_content for doc in docs)
+    """The 'brain' of the operation. This node is responsible for reasoning,
+    planning the research strategy (i.e., choosing which tool to use), and
+    synthesizing the final answer from the gathered information."""
+    def __init__(self, llm: ChatGoogleGenerativeAI, tools: list):
+        # Bind the tools to the LLM. This allows the LLM to generate tool-calling
+        # instructions in a structured format that LangGraph can understand.
+        self.llm = llm.bind_tools(tools)
 
     def run(self, state: AgentState):
-        """Executes the RAG pipeline."""
+        """Executes the agent's logic for a single pass."""
         if debug_mode:
-            print(colored(f"\nAGENT NODE ITERATION {state['iterations'] + 1}", 'magenta'))
-        
-        critique = state.get("critique", "")
-        
-        # --- 1. QUERY FORMULATION ---
-        if state['iterations'] == 0:
-            query_to_search = state['messages'][0].content
-        else:
-            if debug_mode:
-                print(colored(f"Critique received: {critique}", 'yellow'))
-            # --- FIX: Improved prompt to generate better search terms ---
-            reformulate_prompt = ChatPromptTemplate.from_template(
-                """You are a Wikipedia search expert. Your goal is to formulate the best possible search query to find an answer to the user's question, especially after a failed attempt.
-Based on the original query and the critique from the last attempt, identify the key entities (people, concepts, etc.) and create a concise search query that is likely to be a Wikipedia page title.
-Do not use full questions. Do not use quotes.
+            # Print the main iteration header only on the first step of a loop.
+            if state['step'] == 1:
+                print(colored(f"\n--- AGENT ITERATION {state['iterations'] + 1} ---", 'magenta'))
 
-Original Query: {original_query}
-Critique: {critique}
+            # Make the "Thinking..." step more descriptive based on the conversation history.
+            step_description = "Synthesizing final answer..."
+            last_message = state['messages'][-1]
+            if isinstance(last_message, HumanMessage) or state.get('critique'):
+                step_description = "Planning next action..."
+            elif isinstance(last_message, ToolMessage):
+                ai_msg = next((m for m in reversed(state['messages']) if isinstance(m, AIMessage) and m.tool_calls), None)
+                if ai_msg and ai_msg.tool_calls[0]['name'] == 'wikipedia_url_searcher':
+                    step_description = "Deciding which page to read..."
+            print(colored(f"  Step {state['step']}: {step_description}", 'blue'))
 
-Best Wikipedia Search Term:"""
-            )
-            query_formatter = reformulate_prompt | self.llm | StrOutputParser()
-            query_to_search = query_formatter.invoke({
-                "original_query": state['messages'][0].content,
-                "critique": critique
-            })
-        if debug_mode:
-            print(colored(f"Formulated Search Query: '{query_to_search}'", 'cyan'))
+        # The system prompt is the agent's core instruction set.
+        agent_prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are a helpful AI research assistant. Your only source of external information is Wikipedia.
 
-        # --- 2. RETRIEVAL and 3. CHUNKING/EMBEDDING ---
-        if debug_mode:
-            print(colored("Retrieving documents from Wikipedia...", "blue"))
-        docs = retriever.invoke(query_to_search)
-        
-        context = ""
-        if docs:
-            if debug_mode:
-                print(colored("Chunking and embedding documents...", "blue"))
-            chunks = text_splitter.split_documents(docs)
-            vectorstore = FAISS.from_documents(chunks, embeddings)
-            similar_chunks = vectorstore.similarity_search(state['messages'][0].content, k=5)
-            context = self._format_docs(similar_chunks)
-        else:
-            if debug_mode:
-                print(colored("WikipediaRetriever returned no documents for this query.", "yellow"))
+YOUR TASK:
+- First, determine if you can answer the user's query from your own knowledge. For common knowledge questions (e.g., "Who wrote Hamlet?"), answer directly.
+- If you do not know the answer or the question requires current information, you MUST use your tools to research it.
 
-        # --- 4. SYNTHESIS (GENERATION) ---
-        if debug_mode:
-            print(colored("Synthesizing final answer...", "blue"))
-        
-        # --- FIX: The synthesis prompt now considers the critique as a source of information ---
-        synthesis_prompt = ChatPromptTemplate.from_template(
-            """You are an expert synthesizer. Your task is to answer the user's question based on the information available.
-You have two sources of information:
-1.  Retrieved context from a Wikipedia search.
-2.  A critique from a previous failed attempt, which may contain the correct answer.
-
-Instructions:
-- Prioritize the information in the 'Critique' if it is available and directly answers the question.
-- If the critique is not helpful, answer the question based *only* on the provided 'Retrieved Context'.
-- If neither source contains the answer, state that you could not find the information.
-- Be concise and clear in your final answer.
+YOUR RESEARCH WORKFLOW:
+1.  Use the `wikipedia_url_searcher` tool to find the URLs of relevant Wikipedia pages.
+2.  Analyze the search results and identify the single most promising URL.
+3.  Use the `web_page_reader` tool with the best URL to get the full page content.
+4.  Synthesize a comprehensive answer based on the full content you have read.
 
 Today's Date: {today}
-
-Critique from previous attempt:
-{critique}
-
-Retrieved Context:
-{context}
-
-Question:
-{question}"""
-        )
-        synthesis_chain = (
-            synthesis_prompt
-            | self.llm
-            | StrOutputParser()
-        )
-        final_answer = synthesis_chain.invoke({
-            "context": context,
-            "question": state['messages'][0].content,
-            "today": state['today'],
-            "critique": critique
-        })
+Previous Critique: {critique}"""),
+            *state['messages']
+        ])
         
-        return {"messages": state["messages"] + [AIMessage(content=final_answer)]}
+        chain = agent_prompt | self.llm
+        response = chain.invoke({"today": state['today'], "critique": state.get('critique', '')})
+        return {"messages": state["messages"] + [response], "step": state["step"] + 1}
+
+def tool_executor_node(state: AgentState):
+    """
+    The "hands" of the agent. This node is a dedicated, robust function for
+    executing any tool calls the AgentNode decides to make.
+    """
+    if debug_mode:
+        # The tool_call object is a dictionary, so we use key access ['name'].
+        tool_name = state["messages"][-1].tool_calls[0]['name']
+        print(colored(f"  Step {state['step']}: Executing tool '{tool_name}'...", "cyan"))
+
+    tool_calls = state["messages"][-1].tool_calls
+    tool_output_messages = []
+    
+    for call in tool_calls:
+        if call["name"] == "web_page_reader":
+            query = call["args"].get("url")
+        else:
+            query = call["args"].get("query")
+        if query is None: query = next(iter(call["args"].values()), None)
+        
+        tool_to_call = next(t for t in tools if t.name == call["name"])
+        output = tool_to_call.invoke(query)
+        tool_output_messages.append(ToolMessage(content=str(output), tool_call_id=call['id']))
+    
+    # The tool execution step is complete, so we increment the step counter.
+    return {"messages": state["messages"] + tool_output_messages, "step": state["step"] + 1}
 
 class CriticNode:
-    """The node responsible for evaluating the agent's synthesized answer."""
+    """The 'peer reviewer' of the operation. This node evaluates the agent's
+    final answer for quality and accuracy."""
     def __init__(self, llm: ChatGoogleGenerativeAI):
         self.llm = llm
         self.prompt_template = ChatPromptTemplate.from_template(
-"""You are an AI critic. Your job is to evaluate if the agent's last response accurately and completely answers the original user query, given the current date.
-
+"""You are a strict AI critic. Your job is to evaluate if the agent's last response successfully answers the original user query.
 Today's Date: {today}
-
-- If the response is good and factually correct for the given date, write `ACCEPT`.
-- If the response is bad (e.g., inaccurate for the given date, incomplete, or says it can't answer), write `REVISE` and provide a concise reason why, so the agent can reformulate its search.
-
+CRITICAL INSTRUCTIONS:
+- If the agent's response is an admission of failure, you MUST respond with `REVISE`.
+- If the final answer is accurate and complete, write `ACCEPT`.
+- If the answer is incomplete or factually incorrect, write `REVISE` and provide a concise reason.
+Conversation History:
+{conversation_history}
 Original User Query: {original_query}
-Agent's Final Answer: {agent_answer}"""
+Your Critique:"""
         )
 
     def run(self, state: AgentState):
-        """Runs the critic logic."""
+        if debug_mode: print(colored(f"  Step {state['step']}: Evaluating final answer...", 'blue'))
+        history_str = "\n".join([f"{type(msg).__name__}: {getattr(msg, 'content', str(msg))}" for msg in state["messages"]])
         chain = self.prompt_template | self.llm | StrOutputParser()
         critique = chain.invoke({
-            "original_query": state['messages'][0].content,
-            "agent_answer": state['messages'][-1].content,
-            "today": state['today']
+            "original_query": state['messages'][0].content, "conversation_history": history_str, "today": state['today']
         })
-        if debug_mode:
-            print(colored(f"Critic response: {critique}", 'yellow'))
-        return {"critique": critique, "iterations": state["iterations"] + 1}
+        if debug_mode: print(colored(f"Critic response: {critique}", 'yellow'))
+        # The critic increments the main iteration counter and resets the step counter.
+        return {"critique": critique, "iterations": state["iterations"] + 1, "step": 1}
 
-def should_continue(state: AgentState) -> str:
-    """Determines the next step in the workflow."""
-    if state["iterations"] > 3:
-        print(colored("--- Too many iterations, ending workflow ---", "red"))
-        return END
+def should_continue(state: AgentState):
+    """
+    The 'traffic cop' after the agent node. It directs the flow of the graph
+    based on whether the agent decided to use a tool or give a final answer.
+    """
+    last_message = state["messages"][-1]
+    if debug_mode:
+        print(colored(f"  Router: Analyzing agent's last message (type: {type(last_message).__name__}).", "grey"))
     
+    # Use hasattr for a safe check for the tool_calls attribute.
+    if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
+        if debug_mode: print(colored("  Router: Decision -> Execute tools.", "grey"))
+        return "execute_tools"
+    
+    if debug_mode: print(colored("  Router: Decision -> Go to critic.", "grey"))
+    return "critic"
+
+def after_critic_should_continue(state: AgentState) -> str:
+    """
+    The 'traffic cop' after the critic node. It decides whether to end the
+    workflow or send the agent back for revisions.
+    """
+    if state["iterations"] > 3:
+        return END
     if state.get("critique", "").strip().upper().startswith("REVISE"):
         return "agent"
-    else:
-        return END
+    return END
 
 # ==============================================================================
-# GRAPH COMPILATION (Global Scope)
+# # GRAPH COMPILATION AND MAIN EXECUTION
+#
+# This final section brings everything together. First, we define and build the
+# state graph by connecting all our nodes and logic. Then, we compile it into a
+# runnable application. The `main` function provides an interactive
+# command-line interface for the user to chat with the compiled agent.
 # ==============================================================================
-agent_node = AgentNode(llm=ChatGoogleGenerativeAI(model=AGENT_MODEL, temperature=0, google_api_key=google_key))
+# 1. Instantiate the nodes
+agent_node = AgentNode(llm=ChatGoogleGenerativeAI(model=AGENT_MODEL, temperature=0, google_api_key=google_key), tools=tools)
 critic_node = CriticNode(llm=ChatGoogleGenerativeAI(model=CRITIC_MODEL, temperature=0, google_api_key=google_key))
 
+# 2. Build the state graph
 graph_builder = StateGraph(AgentState)
 graph_builder.add_node("agent", agent_node.run)
+graph_builder.add_node("tool_executor", tool_executor_node)
 graph_builder.add_node("critic", critic_node.run)
 
+# 3. Define the graph's edges and conditional routing
 graph_builder.set_entry_point("agent")
-graph_builder.add_edge("agent", "critic")
-graph_builder.add_conditional_edges("critic", should_continue, {"agent": "agent", END: END})
+graph_builder.add_conditional_edges("agent", should_continue, {"execute_tools": "tool_executor", "critic": "critic"})
+graph_builder.add_edge("tool_executor", "agent") # After tools are run, always return to the agent.
+graph_builder.add_conditional_edges("critic", after_critic_should_continue, {"agent": "agent", END: END})
 
+# 4. Compile the graph into a runnable application object.
 app = graph_builder.compile()
 
-# ==============================================================================
-# MAIN EXECUTION BLOCK (for interactive chat)
-# ==============================================================================
 def main():
-    """Sets up and runs the interactive RAG agent chat."""
-    print(colored("Welcome to the RAG-powered AI Agent!", "cyan"))
+    """Sets up and runs the interactive command-line chat application."""
+    print(colored("Welcome to the Wikipedia-powered AI Agent!", "cyan"))
     print("Type your question (or 'exit' to quit):")
-
     while True:
         try:
             q = input(colored("Your question: ", "green")).strip()
             if not q or q.lower() == "exit":
                 print(colored("\nGoodbye!", "cyan"))
                 sys.exit(0)
-
+            
             today_str = datetime.now().strftime("%Y-%m-%d")
-
+            
+            # Create the initial state for the graph for a new query.
             initial_state: AgentState = {
-                "messages": [HumanMessage(content=q)],
-                "critique": "",
-                "iterations": 0,
-                "today": today_str,
+                "messages": [HumanMessage(content=q)], "critique": "", "iterations": 0, "today": today_str, "step": 1,
             }
             
+            # Invoke the graph with the initial state.
             final_state = app.invoke(initial_state)
-            final_answer = final_state["messages"][-1].content
+            final_answer = final_state["messages"][-1]
             
             print(colored("\n--- Final Answer ---", "cyan"))
-            print(colored(final_answer, "white"))
+            print(colored(final_answer.content, "white"))
             print()
-        
+            
         except KeyboardInterrupt:
             print(colored("\nGoodbye!", "cyan"))
             sys.exit(0)
         except Exception as e:
-            print(colored(f"\nAn unexpected error occurred: {e}", "red"))
+            # Print the full traceback in debug mode for easier debugging.
+            if debug_mode:
+                import traceback
+                traceback.print_exc()
+            else:
+                print(colored(f"\nAn unexpected error occurred: {e}", "red"))
             break
 
+# Standard Python entry point.
 if __name__ == "__main__":
     main()
