@@ -2,7 +2,7 @@
 
 # ==============================================================================
 #
-# Project Setup Script for LangGraph Agent
+# Project Setup Script for LangGraph RAG Agent
 #
 # This script automates the setup of the project environment. It performs
 # the following actions:
@@ -10,7 +10,8 @@
 # 2. Creates a Python virtual environment (venv) within that directory.
 # 3. Activates the virtual environment.
 # 4. Installs all required Python packages from a predefined list.
-# 5. Creates a .env file with placeholder API keys for the user to fill in.
+# 5. Creates or updates a .env file with placeholder API keys for the user to
+#    fill in.
 #
 # The script is designed to be idempotent, meaning it can be run multiple
 # times without causing issues. It will detect existing directories and
@@ -24,8 +25,6 @@
 PROJECT_DIR="langgraph-agent"
 # The standard name for the virtual environment subdirectory.
 VENV_SUBDIR_NAME="venv"
-# The name of the environment file for storing API keys.
-ENV_FILE="$PROJECT_DIR/.env"
 
 
 # --- Path and Environment Setup ---
@@ -52,53 +51,42 @@ if [ -d "$ABS_PROJECT_DIR" ]; then
     echo "Directory '$ABS_PROJECT_DIR' already exists."
 
     # Within the existing directory, check for common venv structures.
-    # First, check for a "flat" structure (e.g., project was the venv root).
     if [ -f "$ABS_PROJECT_DIR/bin/activate" ]; then
         echo "Detected existing flat virtual environment structure within '$ABS_PROJECT_DIR'."
         ACTIVATE_SCRIPT_PATH="$ABS_PROJECT_DIR/bin/activate"
-    # Next, check for the standard structure where the venv is in a subdirectory.
     elif [ -f "$ABS_PROJECT_DIR/$VENV_SUBDIR_NAME/bin/activate" ]; then
         echo "Detected existing standard virtual environment structure within '$ABS_PROJECT_DIR/$VENV_SUBDIR_NAME'."
         ACTIVATE_SCRIPT_PATH="$ABS_PROJECT_DIR/$VENV_SUBDIR_NAME/bin/activate"
     else
         # If the directory exists but contains no venv, it's a configuration error.
-        echo "ERROR: '$ABS_PROJECT_DIR' exists, but no 'bin/activate' script was found (neither flat nor in '$VENV_SUBDIR_NAME/')."
-        echo "Please ensure a valid virtual environment exists within '$ABS_PROJECT_DIR'."
+        echo "ERROR: '$ABS_PROJECT_DIR' exists, but no 'bin/activate' script was found."
         exit 1
     fi
 else
     # Case 2: The project directory does NOT exist. Create everything from scratch.
     echo "Creating directory '$ABS_PROJECT_DIR'..."
-    mkdir "$ABS_PROJECT_DIR" || { echo "ERROR: Failed to create directory $ABS_PROJECT_DIR. Exiting."; exit 1; }
+    mkdir "$ABS_PROJECT_DIR" || { echo "ERROR: Failed to create directory. Exiting."; exit 1; }
 
-    echo "Creating new virtual environment in '$VENV_SUBDIR_NAME' inside '$ABS_PROJECT_DIR'..."
+    echo "Creating new virtual environment in '$VENV_SUBDIR_NAME'..."
     # Use 'python3 -m venv' to create the virtual environment inside the project directory.
     (cd "$ABS_PROJECT_DIR" && python3 -m venv "$VENV_SUBDIR_NAME") || \
-        { echo "ERROR: Failed to create virtual environment in '$ABS_PROJECT_DIR/$VENV_SUBDIR_NAME'. Exiting."; exit 1; }
+        { echo "ERROR: Failed to create virtual environment. Exiting."; exit 1; }
 
     # Set the path to the activate script for the newly created venv.
     ACTIVATE_SCRIPT_PATH="$ABS_PROJECT_DIR/$VENV_SUBDIR_NAME/bin/activate"
 fi
 
 # IMPORTANT: Change the current working directory to the project root.
-# This is done *after* all absolute paths have been determined but *before*
-# activation. This ensures that subsequent commands like 'pip' install
-# packages in the correct context and that the user can easily run commands
-# from the project root.
-cd "$ABS_PROJECT_DIR" || { echo "ERROR: Failed to change directory to $ABS_PROJECT_DIR. Exiting."; exit 1; }
+cd "$ABS_PROJECT_DIR" || { echo "ERROR: Failed to change directory. Exiting."; exit 1; }
 
 
 # --- Activate the Virtual Environment ---
 # Deactivate any previously active virtual environment in the current shell.
-# This prevents potential conflicts between different Python environments.
 if type deactivate &>/dev/null; then
-    echo "Deactivating any existing virtual environment..."
     deactivate
 fi
 
 # Activate our target virtual environment using its absolute path.
-# The 'source' command executes the script in the current shell context,
-# modifying the PATH to prioritize the venv's Python and pip installations.
 echo "Activating virtual environment from '$ACTIVATE_SCRIPT_PATH'..."
 if ! source "$ACTIVATE_SCRIPT_PATH"; then
     echo "ERROR: Failed to activate virtual environment. Exiting."
@@ -106,35 +94,19 @@ if ! source "$ACTIVATE_SCRIPT_PATH"; then
 fi
 
 
-# --- DEBUGGING OUTPUT (can be safely removed) ---
-# This section prints information about the current environment after activation
-# to help diagnose any PATH or installation issues.
-echo "--- DEBUGGING AFTER ACTIVATION ---"
-echo "Current working directory: `pwd`"
-echo "Path to Python executable:"
-which python
-which python3
-echo "Path to pip executable:"
-which pip
-echo "Current PATH variable:"
-echo "PATH: $PATH"
-echo "--- End Debugging ---"
-
-
 # --- Install Required Python Packages ---
 echo "Checking and installing Python packages..."
-# A space-separated list of all Python packages required for the project.
-PYTHON_PACKAGES="langgraph langchain_openai langchain_core langchain-google-genai wikipedia pydantic python-dotenv langsmith jmespath termcolor"
+# Defines the list of Python packages required for the project.
+PYTHON_PACKAGES="langgraph langchain_core langchain-google-genai pydantic python-dotenv langsmith jmespath termcolor langchain-community langchain-tavily beautifulsoup4"
 
 # Loop through each package in the list.
 for pkg in $PYTHON_PACKAGES; do
     # Use 'python3 -m pip show' to check if the package is already installed.
-    # The output is redirected to /dev/null to keep the console clean.
     if ! python3 -m pip show "$pkg" &>/dev/null; then
         echo "  Installing $pkg..."
         # Use 'python3 -m pip install' to ensure we are using the pip from our
-        # activated virtual environment.
-        python3 -m pip install "$pkg" || { echo "  ERROR: Failed to install $pkg. Exiting."; exit 1; }
+        # activated virtual environment. Added --quiet flag to reduce install noise.
+        python3 -m pip install --quiet "$pkg" || { echo "  ERROR: Failed to install $pkg. Exiting."; exit 1; }
     else
         echo "  $pkg is already installed."
     fi
@@ -142,20 +114,24 @@ done
 
 
 # --- Create .env File for API Keys ---
-# This section ensures that a .env file exists for storing secret keys.
 # Use the absolute path to avoid ambiguity.
 ABS_ENV_FILE="$ABS_PROJECT_DIR/.env"
 
 echo "Checking for .env file..."
 # Check if the .env file does NOT exist.
 if [ ! -f "$ABS_ENV_FILE" ]; then
-    echo "Creating .env file with placeholder API keys at '$ABS_ENV_FILE'."
+    echo "Creating .env file with placeholder API keys..."
     # Create the file and add placeholder keys. The user must replace these.
-    echo "OPENROUTER_API_KEY=\"your-openrouter-key-here\"" > "$ABS_ENV_FILE"
-    echo "LANGSMITH_API_KEY=\"your-langsmith-key-here\"" >> "$ABS_ENV_FILE"
+    echo "LANGSMITH_API_KEY=\"your-langsmith-key-here\"" > "$ABS_ENV_FILE"
     echo "GOOGLE_API_KEY=\"your-gemini-api-key-here\"" >> "$ABS_ENV_FILE"
+    echo "TAVILY_API_KEY=\"your-tavily-api-key-here\"" >> "$ABS_ENV_FILE"
 else
     echo ".env file already exists. Skipping creation."
+    # Check if TAVILY_API_KEY is missing from an existing file and add it if so.
+    if ! grep -q "TAVILY_API_KEY" "$ABS_ENV_FILE"; then
+        echo "  Adding TAVILY_API_KEY placeholder to existing .env file..."
+        echo "TAVILY_API_KEY=\"your-tavily-api-key-here\"" >> "$ABS_ENV_FILE"
+    fi
 fi
 
 
@@ -163,5 +139,5 @@ fi
 # Print a confirmation message and next steps for the user.
 echo ""
 echo "Setup complete!"
-echo "1. Remember to edit '$ABS_ENV_FILE' with your actual API keys (especially GOOGLE_API_KEY)."
+echo "1. Remember to edit '$ABS_ENV_FILE' with your actual API keys."
 echo "2. Activate your venv in new terminal sessions using: source $ACTIVATE_SCRIPT_PATH"
