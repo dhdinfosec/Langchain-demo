@@ -1,239 +1,136 @@
-# LangGraph "Search-then-Read" RAG Agent (Wikipedia-Only Edition)
+# LangGraph Agent with LangSmith Evaluation
 
-This repository contains a simple, yet sophisticated, conversational AI agent built using LangGraph. The agent mimics a human research process to answer questions by exclusively utilizing Wikipedia as its external information source. This project also demonstrates how to set up an evaluation pipeline using a local Python script for basic testing.
+This project demonstrates the process of building a simple tool using agent with **LangGraph** and evaluating it using **LangSmith**. The goal is to showcase a realistic developer workflow: building a stateful LLM application, creating a test dataset, and running systematic evaluations to measure performance.
 
-## Features
+This repository is a response to the Sr TSE - LS Prompt.
 
-* **Constrained Two-Step RAG ("Search-then-Read")**: The agent employs a specific two-step process:
-    * `wikipedia_url_searcher`: A tool (powered by Tavily) that is hard-coded to search only within `en.wikipedia.org` for relevant URLs.
-    * `web_page_reader`: A tool that reads the full content of a URL provided by the searcher.
-* **Advanced Agentic Reasoning**: The agent's core prompt guides it through this specific research process, allowing it to answer from its own knowledge for common questions or resort to tools for more complex or current information.
-* **CriticNode**: A final quality gate that evaluates the agent's synthesized answer and requests revisions if the response is unsatisfactory.
-* **Local Evaluation Script**: A Python script (`evaluate.py`) is provided to run a predefined suite of tests against the agent and report pass/fail results based on expected keywords in the answers.
-* **LangSmith SDK Evaluation Script**: A Python script (`evaluate_langsmith_custom.py`) is provided to run comprehensive evaluations against the agent using the LangSmith SDK, including a custom LLM-as-a-Judge for scoring.
+### ✨ Features
 
-## Project Structure
+  * **Stateful, Multi-step Agent**: The agent is built using LangGraph, allowing it to maintain conversational history in its state. It can perform multiple steps, like calling a model, then a tool, and then the model again, to arrive at a final answer.
+  * **Dynamic Tool-Use with Tavily Search**: The agent is equipped with a search tool to find up-to-date information. It dynamically decides whether to use this tool based on the LLM's analysis of the user's query.
+  * **Comprehensive Evaluation Suite**: The project includes multiple ways to test the agent, demonstrating a full development cycle:
+      * **Offline Batch Testing**: A simple script for quick, local regression testing against a CSV file.
+      * **Automated SDK Evaluation**: A script that programmatically runs the agent against a local CSV dataset and evaluates with LangSmith.
+      * **Flexible Hybrid Evaluation**: A powerful script that uses command-line arguments and interactive prompts to test against different datasets and judge models configured in LangSmith, perfect for iterative testing.
+  * **Custom LLM-as-a-Judge**: The evaluation scripts use a custom `CorrectnessEvaluator` class, which employs a separate LLM (like `gemini-2.0-flash`) to score the agent's answers for factual accuracy against a reference answer.
 
-* `setup.sh`: A bash script to automate the project environment setup, including virtual environment creation and package installation.
-* `agent.py`: Contains the core LangGraph agent implementation, defining its state, nodes (Agent, Tool Executor, Critic), and the logic (edges) that connect them.
-* `evaluate.py`: A Python script for running automated local evaluations of the agent using a keyword-based assertion approach.
-* `evaluate_langsmith_custom.py`: A Python script for running automated evaluations of the agent using the LangSmith SDK and a custom LLM-as-a-Judge.
-* `README.md` (this file): Provides an overview of the project, setup instructions, and how to run the agent and its evaluations.
+### 📂 Project Structure
 
-## Getting Started
+```
+.
+├── agent.py                  # The core LangGraph agent definition.
+├── dataset.csv                 # A synthetic dataset for evaluation.
+├── evaluate.py                 # Simple script for offline batch testing against dataset.csv.
+├── evaluate_langsmith.py       # Runs evaluation against dataset.csv using a hardcoded LLM judge.
+├── evaluate_langsmith_custom.py# Runs evaluation against a specified LangSmith dataset and judge model.
+├── setup.sh                    # Shell script to set up the environment.
+├── .env                        # (You must create this) For API keys.
+└── README.md                   # This file.
+```
 
-Follow these steps to set up the project and run the agent and its evaluations.
+### 🚀 Setup and Installation
 
-### Prerequisites
+Follow these steps to set up your local environment.
 
-* Python 3.9+
-* `bash` (for running the setup script)
+1.  **Clone the Repository**
+2.  **Create and Configure Environment Variables** in a `.env` file with your API keys.
+3.  **Run the Setup Script**: `bash setup.sh`.
+4.  **Activate the Virtual Environment**: `source venv/bin/activate`.
 
-### 1. Setup the Environment
+#### Example Setup Output
 
-The `setup.sh` script automates the creation of a virtual environment and installation of necessary Python packages.
+```
+./setup.sh
+Creating directory '/home/damian/Documents/Personal/Langchain/langgraph-agent'...
+Creating new virtual environment in 'venv'...
+...
+Setup complete!
+1. Remember to edit '/home/damian/Documents/Personal/Langchain/langgraph-agent/.env' with your actual API keys.
+2. Activate your venv in new terminal sessions using: source /home/damian/Documents/Personal/Langchain/langgraph-agent/venv/bin/activate
+```
 
-1.  **Run the setup script:**
-    ```bash
-    bash setup.sh
-    ```
-    This script will:
-    * Create a `langgraph-agent` directory in your current location if it doesn't exist.
-    * Create and activate a Python virtual environment named `venv` inside `langgraph-agent`.
-    * Install all required Python packages (e.g., `langgraph`, `langchain-google-genai`, `langsmith`, `python-dotenv`, `langchain-tavily`, etc.).
-    * Create a `.env` file in the `langgraph-agent` directory with placeholders for your API keys.
+### 🏗️ Agent Architecture (`agent.py`)
 
-2.  **Important: Configure your API Keys:**
-    After running `setup.sh`, you **must** edit the newly created `.env` file within the `langgraph-agent` directory. Replace the placeholder values with your actual API keys:
+The core logic of the agent is defined in `agent.py` using LangGraph's state-machine paradigm. The architecture consists of a state, nodes, and conditional edges.
 
-    ```ini
-    LANGSMITH_API_KEY="your-langsmith-key-here"
-    GOOGLE_API_KEY="your-gemini-api-key-here"
-    TAVILY_API_KEY="your-tavily-api-key-here"
-    ```
-    * **`LANGSMITH_API_KEY`**: Required for LangSmith evaluation.
-    * **`GOOGLE_API_KEY`**: Required for the `ChatGoogleGenerativeAI` models used by the agent and the custom LLM-as-a-Judge.
-    * **`TAVILY_API_KEY`**: Required for the `wikipedia_url_searcher` tool.
+  * **State (`AgentState`)**: The agent's memory is a structured `TypedDict` that is passed between nodes and updated at each step.
+  * **Nodes (`call_model`, `call_tool`)**: These are the processing units. `call_model` invokes the LLM, while `call_tool` executes the Tavily search.
+  * **Conditional Edges (`should_continue`)**: This is the logic that connects the nodes, creating a loop. It checks if the model wants to call a tool and routes the flow accordingly.
 
-### 2. Run the Agent (Interactive Mode)
+### 💬 Interacting with the Agent
 
-You can interact with the agent directly from your terminal.
+While the evaluation scripts focus on batch processing, the core agent from `agent.py` can be used for direct, single-question interactions. This is the best way to perform a quick, qualitative check of the agent's abilities.
 
-1.  **Ensure your virtual environment is active.** If you open a new terminal, navigate to the `langgraph-agent` directory and activate the environment:
-    ```bash
-    cd langgraph-agent
-    source venv/bin/activate
-    ```
-2.  **Run the agent:**
-    ```bash
-    python3 agent.py
-    ```
-3.  Type your questions at the prompt (e.g., "What is the capital of France?") and press Enter. Type `exit` to quit.
+#### Example Interaction
 
-    By default, the agent runs in a concise mode:
-    ```
-    Welcome to the Wikipedia-powered AI Agent!
-    Type your question (or 'exit' to quit):
-    Your question: Who wrote Hamlet?
+```
+$ python3 agent.py
+Welcome to the Wikipedia-powered AI Agent!
+Type your question (or 'exit' to quit):
+Your question: How large is the United States of America?
 
-    --- Final Answer ---
-    William Shakespeare wrote Hamlet.
-    ```
+--- Final Answer ---
+The total area of the United States is 3,796,742 square miles (9,833,520 km2). The land area is 3,531,905 square miles (9,147,590 km2).
+```
 
-    You can also run the agent with a `--debug` parameter to see more verbose output about its internal steps. The `--debug` parameter provides detailed insights into the agent's thought process, including each step of its reasoning, tool execution, and the critic's evaluation.
+### ⚙️ Automated Evaluation Workflows
 
-    With `--debug`:
-    ```bash
-    python3 agent.py --debug
-    ```
-    Example output with `--debug`:
-    ```
-    Welcome to the Wikipedia-powered AI Agent!
-    Type your question (or 'exit' to quit):
-    Your question: What is the population of England?
+This project provides three distinct methods for running automated, batch evaluations.
 
-    --- AGENT ITERATION 1 ---
-      Step 1: Planning next action...
-      Router: Analyzing agent's last message (type: AIMessage).
-      Router: Decision -> Execute tools.
-      Step 2: Executing tool 'wikipedia_url_searcher'...
-      Step 3: Deciding which page to read...
-      Router: Analyzing agent's last message (type: AIMessage).
-      Router: Decision -> Execute tools.
-      Step 4: Executing tool 'web_page_reader'...
-      Step 5: Synthesizing final answer...
-      Router: Analyzing agent's last message (type: AIMessage).
-      Router: Decision -> Go to critic.
-      Step 6: Evaluating final answer...
-    Critic response: ACCEPT
+#### Method 1: Offline Batch Evaluation (`evaluate.py`)
 
-    --- Final Answer ---
-    The population of England was estimated to be 57,106,398 in 2022. The 2021 census recorded the population as 56,490,048.
-    ```
+This is the most basic evaluation method. It runs the agent against the local `dataset.csv` file to perform a quick, static regression test without any dependency on LangSmith for scoring.
 
-### 3. Run the Automated Local Evaluation
-
-The `evaluate.py` script allows you to test the agent against a predefined dataset using a local keyword-based assertion approach.
-
-1.  **Ensure your virtual environment is active** (see step 1 above).
-2.  **Run the evaluation script:**
-    ```bash
-    python3 evaluate.py
-    ```
-    or, to see verbose debugging output from the agent during evaluation:
-    ```bash
-    python3 evaluate.py --debug
-    ```
-3.  The script will iterate through a set of predefined queries, send them to the agent, and check if the agent's answer contains specific keywords. A summary report will be printed at the end, indicating how many tests passed and failed.
-
-    *Example Output Snippet:*
+  * **Purpose**: Quick, offline validation to ensure the agent runs without errors across a set of questions.
+  * **Usage**: `python3 evaluate.py`
+  * **Example Output**:
     ```
     --- Starting Agent Evaluation ---
 
     [1/8] Running test for query: 'What is the capital of Japan?'
       - Agent's Answer: The capital of Japan is Tokyo.
       [PASS]
-
-    [2/8] Running test for query: 'Who invented the telephone?'
-      - Agent's Answer: The telephone was invented by Alexander Graham Bell.
-      [PASS]
-
     ...
-
     --- Evaluation Summary ---
     Total Tests: 8
       Passed: 8
       Failed: 0
     ```
 
-### 4. Run the Automated LangSmith Evaluation
+#### Method 2: Automated Evaluation with LangSmith (`evaluate_langsmith.py`)
 
-The `evaluate_langsmith_custom.py` script allows you to run a comprehensive evaluation of the agent using the LangSmith SDK. This script utilizes a custom LLM-as-a-Judge evaluator (powered by Gemini) to score the agent's answers against a reference dataset.
+This script elevates the testing by integrating LangSmith for automated tracing and scoring, while still using the local dataset file.
 
-1.  **Ensure your virtual environment is active** (see step 1 above).
-2.  **Ensure you have created a dataset named `ds-demo` in LangSmith** with the questions and reference answers you wish to evaluate against.
-3.  **Run the evaluation script:**
-    ```bash
-    python3 evaluate_langsmith_custom.py
+  * **Purpose**: To run a reproducible evaluation against a local dataset with scoring done by an LLM-as-a-judge.
+  * **Usage**: `python3 evaluate_langsmith.py`
+  * **Example Output**:
     ```
-    You can also run with a `--debug` parameter for more verbose logging during the evaluation process:
-    ```bash
-    python3 evaluate_langsmith_custom.py --debug
-    ```
-4.  The script will fetch the `ds-demo` dataset from LangSmith, invoke the agent for each example, and use the custom Gemini-powered judge to score the answers. It will then print a summary of the results to the console, including the score for each question.
-
-    *Example Output:*
-    ```
-    --- Starting LangSmith SDK Custom Evaluation ---
-    2025-07-23 03:08:02,047 - INFO - Found project 'LangGraph RAG Agent' with ID 225e2bbf-7add-4f5d-b49a-5176ab971c8e
+    --- Starting LangSmith SDK Evaluation ---
     Found existing dataset 'ds-demo'.
-    2025-07-23 03:08:03,006 - INFO - Dataset ID: ea56c294-7249-4a23-84ab-dfcb626c9afd
 
     Starting evaluation run. This may take a few minutes...
-    View the evaluation results for experiment: 'Wikipedia-Agent-Custom-Gemini-Judge-2a9579fa' at:
-    [https://smith.langchain.com/o/4acdec47-e18b-4d6f-a676-6a4312603733/datasets/ea56c294-7249-4a23-84ab-dfcb626c9afd/compare?selectedSessions=a9e31572-b251-46c0-ac67-56802695e742](https://smith.langchain.com/o/4acdec47-e18b-4d6f-a676-6a4312603733/datasets/ea56c294-7249-4a23-84ab-dfcb626c9afd/compare?selectedSessions=a9e31572-b251-46c0-ac67-56802695e742)
-
-
-    8it [00:45,  5.68s/it]
+    View the evaluation results for experiment: 'Wikipedia-Agent-Correctness-SDK-4da73057' at:
+    https://smith.langchain.com/o/4acdec47-e18b-4d6f-a676-6a4312603733/datasets/ea56c294-7249-4a23-84ab-dfcb626c9afd/compare?selectedSessions=375f7299-69fa-48d2-a01b-fb849d06b131
 
     --- Evaluation Complete ---
-
-    Evaluation Results Summary:
-    1. Question: Who wrote Hamlet?
-       Reference: Hamlet was written by William Shakespeare.
-       Predicted: William Shakespeare wrote Hamlet.
-       Score: 1 (Correct)
-    ---
-    2. Question: Who invented the telephone?
-       Reference: The telephone was invented by Alexander Graham Bell.
-       Predicted: Alexander Graham Bell is credited with inventing the telephone.
-       Score: 1 (Correct)
-    ---
-    3. Question: What is the population of Canada?
-       Reference: The population of Canada is over 38 million people.
-       Predicted: As of 2024, Canada's population is estimated to be over 41.5 million.
-       Score: 1 (Correct)
-    ---
-    4. Question: What is the capital of Japan?
-       Reference: The capital of Japan is Tokyo.
-       Predicted: The capital of Japan is Tokyo.
-       Score: 1 (Correct)
-    ---
-    5. Question: When was the Eiffel Tower built?
-       Reference: The Eiffel Tower was completed in 1889.
-       Predicted: The Eiffel Tower was built from 1887 to 1889. Construction started on 28 January 1887, and it was completed on 31 March 1889. The tower was opened on 15 May 1889.
-       Score: 1 (Correct)
-    ---
-    6. Question: What is the chemical symbol for gold?
-       Reference: The chemical symbol for gold is Au.
-       Predicted: The chemical symbol for gold is Au.
-       Score: 1 (Correct)
-    ---
-    7. Question: What is the tallest mountain in the world?
-       Reference: The tallest mountain in the world is Mount Everest.
-       Predicted: The tallest mountain in the world is Mount Everest.
-       Score: 1 (Correct)
-    ---
-    8. Question: What is Java? (programming language)
-       Reference: Java is a high-level, class-based, object-oriented programming language.
-       Predicted: Java is a high-level, general-purpose, memory-safe, object-oriented programming language. It was designed to allow programmers to "write once, run anywhere" (WORA), meaning that compiled Java code can run on any platform that supports Java without recompilation. Java applications are typically compiled to bytecode that can run on any Java virtual machine (JVM). The syntax of Java is similar to C and C++, but it has fewer low-level facilities.
-
-    Java was designed by James Gosling at Sun Microsystems and released in May 1995. It has gained popularity since its release and has been a popular programming language.
-       Score: 1 (Correct)
-    ---
-    Evaluation finished, but no project link was generated.
     ```
 
-## What's Next (Future Work)
+#### Method 3: Hybrid Evaluation with UI + SDK (`evaluate_langsmith_custom.py`)
 
-* **UI-based LangSmith Evaluation**: Demonstrate how to create and run evaluation experiments directly from the LangSmith UI.
-* **More Robust Error Handling**: Enhance error handling within the agent's tools and nodes.
-* **Expanded Test Dataset**: Grow the evaluation dataset with more diverse and challenging queries.
-* **Agent Improvements**: Explore more advanced LangGraph patterns, such as self-correction loops or integrating additional tools.
+This is the most powerful evaluation method, demonstrating the synergy between the LangSmith UI for data management and the SDK for execution.
 
-## Known Limitations / Friction Log
+  * **Purpose**: To run experiments against centrally-managed datasets in the LangSmith UI, with the flexibility to change parameters via the command line or interactive prompts.
+  * **Usage**:
+      * Interactive: `python3 evaluate_langsmith_custom.py --debug`
+      * Non-Interactive: `python3 evaluate_langsmith_custom.py --dataset ds-loyal-ceramics-83 --model gemini-2.0-flash`
 
-* **Hardcoded Wikipedia Scope**: The `wikipedia_url_searcher` is strictly limited to Wikipedia. While intentional for this demo, a real-world agent would likely need broader search capabilities.
-* **Critic Node Simplicity**: The current CriticNode is quite basic. It simply accepts or rejects based on a simple prompt. More sophisticated critique mechanisms could be explored.
-* **Debugging Verbosity**: While `--debug` mode provides useful insights into the agent's flow, the sheer volume of output can sometimes be overwhelming for complex traces. Better structured logging or visualization tools would be beneficial.
-* **API Key Management**: Requiring manual editing of `.env` is standard but less convenient for quick starts. Future iterations might consider safer, more automated credential management for demos.
+### 🤔 Learnings & Friction Log
+
+While building this project, I noted several hurdles and learnings that informed the final design. This log addresses the "what might confuse a new user" and "what you learned" aspects of the prompt.
+
+  * **UI-Driven Evaluation Workflow**: A key point of friction is the user journey for initiating evaluations on custom agents. After creating a dataset in the UI, a user's natural next step is to look for a "Run" button to test their local agent, but the primary path requires switching to the SDK.
+  * **Evaluator Precedence (UI vs. SDK)**: The relationship between evaluators defined in the UI versus those defined in the SDK can be confusing. It's not immediately obvious that an evaluator defined in a Python script will silently override a UI-based evaluator with the same feedback key during an SDK-driven run.
+  * **Local Model Performance**: Initial attempts to use local Small Language Models (SLMs) like Microsoft's Phi resulted in slow response times (minutes per query) on CPU-only hardware. This necessitated a pivot to a more performant, cloud-based API like Google's Gemini to ensure a reasonable user experience.
+  * **Advanced Tooling for Retrieval**: A simple, direct Wikipedia query tool was initially used but proved insufficient for complex questions. The agent's accuracy was significantly improved by pivoting to a more robust, two-step retrieval process: first using `wikipedia_url_searcher` to find a relevant page, and then using `web_page_reader` to extract the specific information.
+  * **Model-Specific Parsing**: Integrating with the Gemini API introduced some unique parsing requirements within LangGraph, particularly around how tool calls are structured in the model's output. This highlighted that agent logic can be tightly coupled to the specific model provider's output format, and may require different handling compared to models from OpenAI.
+  * **Guardrails Integration Complexity**: An early development goal was to include Guardrails for response moderation. However, integrating this layer with the existing LangGraph state machine proved complex and was ultimately removed to focus on the core agent and evaluation workflow.
