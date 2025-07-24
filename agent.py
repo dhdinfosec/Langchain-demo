@@ -141,6 +141,42 @@ class AgentState(TypedDict):
     today: str
     step: int
 
+# --- Helper for Debug Printing (Unified Debug Info) ---
+# This helper function centralizes and standardizes all debug output.
+# It's called after each significant step in the graph (AgentNode.run, tool_executor_node, CriticNode.run)
+def _print_debug_info(state: AgentState, debug_mode: bool = False):
+    if not debug_mode:
+        return
+
+    # Updated: Added bold to iteration header for more prominence
+    print(colored(f"\n--- AGENT ITERATION {state['iterations']} ---", "yellow", attrs=["bold"]))
+    
+    # Updated: More descriptive print for tool calls
+    if state.get("tool_calls"):
+        print(colored(f"  Tool Calls Executed: {state['tool_calls']}", "cyan"))
+    
+    # Updated: More descriptive print for tool output
+    if state.get("tool_output"):
+        print(colored(f"  Tool Output Received: {state['tool_output']}", "cyan"))
+
+    # Updated: Clearer critic response message and consistent coloring
+    if state.get("critique"):
+        critique_content = state['critique'].strip()
+        critic_status = "ACCEPT" if "ACCEPT" in critique_content.upper() else "REVISE"
+        critic_color = "green" if critic_status == "ACCEPT" else "red"
+        print(colored(f"  Critic Feedback: {critic_status} - {critique_content}", critic_color, attrs=["bold"]))
+
+    # Updated: Show LLM's thought/response if it's not directly a tool call, in magenta
+    if state["messages"] and isinstance(state["messages"][-1], AIMessage):
+        last_message = state["messages"][-1]
+        # Only print AI message content if it's not a tool call (tools are handled separately)
+        if not last_message.tool_calls:
+            print(colored(f"  LLM Thought/Response: {last_message.content}", "magenta"))
+
+    # Note: state['step'] is now incremented within AgentNode.run, tool_executor_node, CriticNode.run
+    # This function just prints the current state, not modifies step count directly.
+
+
 class AgentNode:
     """The 'brain' of the operation. This node is responsible for reasoning,
     planning the research strategy (i.e., choosing which tool to use), and
@@ -153,10 +189,6 @@ class AgentNode:
     def run(self, state: AgentState):
         """Executes the agent's logic for a single pass."""
         if debug_mode:
-            # Print the main iteration header only on the first step of a loop.
-            if state['step'] == 1:
-                print(colored(f"\n--- AGENT ITERATION {state['iterations'] + 1} ---", 'magenta'))
-
             # Make the "Thinking..." step more descriptive based on the conversation history.
             step_description = "Synthesizing final answer..."
             last_message = state['messages'][-1]
@@ -167,7 +199,7 @@ class AgentNode:
                 if ai_msg and ai_msg.tool_calls[0]['name'] == 'wikipedia_url_searcher':
                     step_description = "Deciding which page to read..."
             print(colored(f"  Step {state['step']}: {step_description}", 'blue'))
-
+            
         # The system prompt is the agent's core instruction set.
         agent_prompt = ChatPromptTemplate.from_messages([
             ("system", """You are a helpful AI research assistant. Your only source of external information is Wikipedia.
@@ -189,7 +221,15 @@ Previous Critique: {critique}"""),
         
         chain = agent_prompt | self.llm
         response = chain.invoke({"today": state['today'], "critique": state.get('critique', '')})
-        return {"messages": state["messages"] + [response], "step": state["step"] + 1}
+        
+        # Increment step and add response to messages *before* printing debug info
+        new_state = {"messages": state["messages"] + [response], "step": state["step"] + 1}
+
+        # Call the unified debug print function after the agent's action
+        if debug_mode:
+            _print_debug_info(new_state) # Pass the updated state for accurate debug info
+
+        return new_state
 
 def tool_executor_node(state: AgentState):
     """
@@ -215,8 +255,14 @@ def tool_executor_node(state: AgentState):
         output = tool_to_call.invoke(query)
         tool_output_messages.append(ToolMessage(content=str(output), tool_call_id=call['id']))
     
-    # The tool execution step is complete, so we increment the step counter.
-    return {"messages": state["messages"] + tool_output_messages, "step": state["step"] + 1}
+    # Increment step and add tool outputs to messages *before* printing debug info
+    new_state = {"messages": state["messages"] + tool_output_messages, "step": state["step"] + 1}
+    
+    # Call the unified debug print function after tool execution
+    if debug_mode:
+        _print_debug_info(new_state) # Pass the *updated* state for accurate debug info
+
+    return new_state
 
 class CriticNode:
     """The 'peer reviewer' of the operation. This node evaluates the agent's
@@ -243,9 +289,15 @@ Your Critique:"""
         critique = chain.invoke({
             "original_query": state['messages'][0].content, "conversation_history": history_str, "today": state['today']
         })
-        if debug_mode: print(colored(f"Critic response: {critique}", 'yellow'))
+        
         # The critic increments the main iteration counter and resets the step counter.
-        return {"critique": critique, "iterations": state["iterations"] + 1, "step": 1}
+        new_state = {"critique": critique, "iterations": state["iterations"] + 1, "step": 1}
+        
+        # Call the unified debug print function after the critic's action
+        if debug_mode:
+            _print_debug_info(new_state) # Pass the *updated* state for accurate debug info
+
+        return new_state
 
 def should_continue(state: AgentState):
     """
@@ -254,14 +306,19 @@ def should_continue(state: AgentState):
     """
     last_message = state["messages"][-1]
     if debug_mode:
-        print(colored(f"  Router: Analyzing agent's last message (type: {type(last_message).__name__}).", "grey"))
+        # Changed color to yellow and added bold
+        print(colored(f"  Router: Analyzing agent's last message (type: {type(last_message).__name__}).", "yellow", attrs=["bold"]))
     
     # Use hasattr for a safe check for the tool_calls attribute.
     if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
-        if debug_mode: print(colored("  Router: Decision -> Execute tools.", "grey"))
+        if debug_mode: 
+            # Changed color to yellow and added bold
+            print(colored("  Router: Decision -> Execute tools.", "yellow", attrs=["bold"]))
         return "execute_tools"
     
-    if debug_mode: print(colored("  Router: Decision -> Go to critic.", "grey"))
+    if debug_mode: 
+        # Changed color to yellow and added bold
+        print(colored("  Router: Decision -> Go to critic.", "yellow", attrs=["bold"]))
     return "critic"
 
 def after_critic_should_continue(state: AgentState) -> str:
@@ -269,10 +326,25 @@ def after_critic_should_continue(state: AgentState) -> str:
     The 'traffic cop' after the critic node. It decides whether to end the
     workflow or send the agent back for revisions.
     """
+    if debug_mode:
+        # Changed color to yellow and added bold
+        print(colored(f"  Router: Analyzing critic's decision.", "yellow", attrs=["bold"]))
+
     if state["iterations"] > 3:
+        if debug_mode:
+            # Changed color to yellow and added bold
+            print(colored("  Router: Decision -> Max iterations reached (END).", "yellow", attrs=["bold"]))
         return END
+    
     if state.get("critique", "").strip().upper().startswith("REVISE"):
+        if debug_mode:
+            # Changed color to yellow and added bold
+            print(colored("  Router: Decision -> Revision requested (agent).", "yellow", attrs=["bold"]))
         return "agent"
+    
+    if debug_mode:
+        # Changed color to yellow and added bold
+        print(colored("  Router: Decision -> Critique accepted (END).", "yellow", attrs=["bold"]))
     return END
 
 # ==============================================================================
@@ -304,7 +376,7 @@ app = graph_builder.compile()
 
 def main():
     """Sets up and runs the interactive command-line chat application."""
-    print(colored("Welcome to the Wikipedia-powered AI Agent!", "cyan"))
+    print(colored("Welcome to the Wikipedia-powered AI Agent! If you're running with --debug, expect verbose output!", "cyan")) # Updated welcome message
     print("Type your question (or 'exit' to quit):")
     while True:
         try:
@@ -324,12 +396,12 @@ def main():
             final_state = app.invoke(initial_state)
             final_answer = final_state["messages"][-1]
             
-            print(colored("\n--- Final Answer ---", "cyan"))
-            print(colored(final_answer.content, "white"))
+            print(colored("\n--- Final Answer ---", "cyan", attrs=["bold"])) # Bold final answer header
+            print(colored(final_answer.content, "white", attrs=["bold"])) # Bold final answer content
             print()
             
         except KeyboardInterrupt:
-            print(colored("\nGoodbye!", "cyan"))
+            print(colored("\nGoodbye! (Interrupted)", "cyan")) # Clarify goodbye message
             sys.exit(0)
         except Exception as e:
             # Print the full traceback in debug mode for easier debugging.
